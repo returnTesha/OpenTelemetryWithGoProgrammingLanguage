@@ -1,10 +1,10 @@
 package main
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
+	"github.com/redis/go-redis/v9"
 	"log"
 	"log/slog"
 	"net/http"
@@ -36,6 +36,10 @@ type TaskRequest struct {
 
 func main() {
 	ctx := context.Background()
+
+	rdb := redis.NewClient(&redis.Options{
+		Addr: "localhost:6379",
+	})
 
 	// 1. Trace 초기화
 	shutdownTracer := initTracer()
@@ -129,24 +133,41 @@ func main() {
 
 		fmt.Printf("✅ [Fiber] 완료!\n")
 
-		go func(targetURL, traceID string) {
+		go func(traceID string) {
 			payload := map[string]string{
 				"trace_id": traceID,
 				"status":   "DONE",
-				"message":  "PDF 아카이빙 성공",
+				"message":  "Redis로 알림 보냄",
 			}
 			jsonBody, _ := json.Marshal(payload)
 
-			// Gateway로 POST 요청 발사!
-			// (실제 운영에선 재시도(Retry) 로직이 필요하지만 지금은 심플하게)
-			resp, err := http.Post("http://localhost:8080/callbacks/task-complete", "application/json", bytes.NewBuffer(jsonBody))
+			// "task.complete" 채널에 발행(Publish)
+			err := rdb.Publish(context.Background(), "task.complete", jsonBody).Err()
+
 			if err != nil {
-				fmt.Printf("❌ 콜백 실패: %v\n", err)
-				return
+				slog.Error("Redis 발행 실패", "error", err)
+			} else {
+				fmt.Printf("📢 [Worker] Redis 이벤트 발행 완료 (TraceID: %s)\n", traceID)
 			}
-			defer resp.Body.Close()
-			fmt.Printf("📞 [Worker] Gateway로 콜백 완료\n")
-		}("http://localhost:8080/callbacks/task-complete", traceID)
+		}(traceID)
+		//go func(targetURL, traceID string) {
+		//	payload := map[string]string{
+		//		"trace_id": traceID,
+		//		"status":   "DONE",
+		//		"message":  "PDF 아카이빙 성공",
+		//	}
+		//	jsonBody, _ := json.Marshal(payload)
+		//
+		//	// Gateway로 POST 요청 발사!
+		//	// (실제 운영에선 재시도(Retry) 로직이 필요하지만 지금은 심플하게)
+		//	resp, err := http.Post("http://localhost:8080/callbacks/task-complete", "application/json", bytes.NewBuffer(jsonBody))
+		//	if err != nil {
+		//		fmt.Printf("❌ 콜백 실패: %v\n", err)
+		//		return
+		//	}
+		//	defer resp.Body.Close()
+		//	fmt.Printf("📞 [Worker] Gateway로 콜백 완료\n")
+		//}("http://localhost:8080/callbacks/task-complete", traceID)
 
 		return c.Status(http.StatusOK).JSON(fiber.Map{
 			"status": "PROCESSED",

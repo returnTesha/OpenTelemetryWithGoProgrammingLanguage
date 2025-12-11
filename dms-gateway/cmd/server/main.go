@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"github.com/gin-gonic/gin"
+	"github.com/redis/go-redis/v9"
 	"go.opentelemetry.io/contrib/bridges/otelslog"
 	"go.opentelemetry.io/contrib/instrumentation/github.com/gin-gonic/gin/otelgin"
 	"go.opentelemetry.io/otel/codes"
@@ -43,6 +44,38 @@ var jobQueue = make(chan Job, 100000)
 
 func main() {
 	ctx := context.Background()
+
+	rdb := redis.NewClient(&redis.Options{
+		Addr: "localhost:6379", // 도커 컴포즈 서비스명 쓰려면 "redis:6379"
+	})
+
+	go func() {
+		// "task.complete" 라는 채널을 구독
+		pubsub := rdb.Subscribe(ctx, "task.complete")
+		defer pubsub.Close()
+
+		// 채널 획득
+		ch := pubsub.Channel()
+
+		fmt.Println("🎧 [Gateway] Redis 구독 시작: task.complete 채널 대기 중...")
+
+		// 메시지가 올 때까지 여기서 대기 (무한 루프)
+		for msg := range ch {
+			var result struct {
+				TraceID string `json:"trace_id"`
+				Status  string `json:"status"`
+				Message string `json:"message"`
+			}
+			json.Unmarshal([]byte(msg.Payload), &result)
+
+			// 로그 찍기 (Loki로 전송)
+			slog.InfoContext(ctx, "📢 [Redis] 작업 완료 수신!",
+				"original_trace_id", result.TraceID,
+				"status", result.Status,
+				"msg_source", "redis-pubsub",
+			)
+		}
+	}()
 
 	// 1. Trace 초기화
 	shutdown := initTracer()

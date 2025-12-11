@@ -11,3 +11,8 @@ services:
     environment:
       - GF_AUTH_ANONYMOUS_ENABLED=true  # 비로그인 접속 허용
       - GF_AUTH_ANONYMOUS_ORG_ROLE=Admin # 들어오면 바로 관리자 권한
+  redis:
+    image: redis:alpine
+    container_name: message-broker
+    ports:
+      - "6379:6379"
