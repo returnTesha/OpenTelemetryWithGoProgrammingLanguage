@@ -1,10 +1,13 @@
 package main
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
 	"log"
 	"log/slog"
+	"net/http"
 	"time"
 
 	"github.com/gofiber/fiber/v2"
@@ -126,12 +129,27 @@ func main() {
 
 		fmt.Printf("✅ [Fiber] 완료!\n")
 
-		return c.Status(200).JSON(fiber.Map{
-			"status":    "PROCESSED",
-			"handler":   "Fiber Worker",
-			"file_loc":  "/storage/" + req.DocTitle + ".pdf",
-			"timestamp": time.Now().Unix(),
-			"trace_id":  traceID,
+		go func(targetURL, traceID string) {
+			payload := map[string]string{
+				"trace_id": traceID,
+				"status":   "DONE",
+				"message":  "PDF 아카이빙 성공",
+			}
+			jsonBody, _ := json.Marshal(payload)
+
+			// Gateway로 POST 요청 발사!
+			// (실제 운영에선 재시도(Retry) 로직이 필요하지만 지금은 심플하게)
+			resp, err := http.Post("http://localhost:8080/callbacks/task-complete", "application/json", bytes.NewBuffer(jsonBody))
+			if err != nil {
+				fmt.Printf("❌ 콜백 실패: %v\n", err)
+				return
+			}
+			defer resp.Body.Close()
+			fmt.Printf("📞 [Worker] Gateway로 콜백 완료\n")
+		}("http://localhost:8080/callbacks/task-complete", traceID)
+
+		return c.Status(http.StatusOK).JSON(fiber.Map{
+			"status": "PROCESSED",
 		})
 	})
 

@@ -112,6 +112,26 @@ func main() {
 		}
 	})
 
+	r.POST("/callbacks/task-complete", func(c *gin.Context) {
+		var result struct {
+			TraceID string `json:"trace_id"`
+			Status  string `json:"status"`
+			Message string `json:"message"`
+		}
+		if err := c.ShouldBindJSON(&result); err != nil {
+			return
+		}
+
+		// 로그 찍기 (여기서 DB 업데이트나 클라이언트에게 웹소켓 알림을 보냄)
+		// context를 새로 만들지 않고, 들어온 요청의 context를 사용해 로그를 남김
+		slog.InfoContext(c.Request.Context(), "📨 [Gateway] Worker로부터 완료 보고 수신!",
+			"original_trace_id", result.TraceID,
+			"status", result.Status,
+		)
+
+		c.JSON(200, gin.H{"ack": "ok"})
+	})
+
 	fmt.Println("Gin gateway running on :8080")
 	r.Run(":8080")
 }
