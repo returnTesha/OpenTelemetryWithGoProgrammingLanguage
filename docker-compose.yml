@@ -1,0 +1,13 @@
+version: "3"
+services:
+  # 이 녀석 하나가 Prometheus + Jaeger + Loki + Grafana 역할을 다 합니다.
+  lgtm:
+    image: grafana/otel-lgtm:latest
+    container_name: lgtm
+    ports:
+      - "3000:3000"   # Grafana UI (로그인 없이 접속됨)
+      - "4317:4317"   # OTLP gRPC 수신 (Spring이 여기로 쏨)
+      - "4318:4318"   # OTLP HTTP 수신
+    environment:
+      - GF_AUTH_ANONYMOUS_ENABLED=true  # 비로그인 접속 허용
+      - GF_AUTH_ANONYMOUS_ORG_ROLE=Admin # 들어오면 바로 관리자 권한
