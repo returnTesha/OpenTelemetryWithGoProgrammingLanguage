@@ -1,18 +1,103 @@
 version: "3"
 services:
-  # 이 녀석 하나가 Prometheus + Jaeger + Loki + Grafana 역할을 다 합니다.
+  # LGTM - Prometheus + Jaeger + Loki + Grafana 통합
   lgtm:
     image: grafana/otel-lgtm:latest
     container_name: lgtm
     ports:
-      - "3000:3000"   # Grafana UI (로그인 없이 접속됨)
-      - "4317:4317"   # OTLP gRPC 수신 (Spring이 여기로 쏨)
-      - "4318:4318"   # OTLP HTTP 수신
+      - "3000:3000"   # Grafana UI
+      - "4317:4317"   # OTLP gRPC
+      - "4318:4318"   # OTLP HTTP
     environment:
-      - GF_AUTH_ANONYMOUS_ENABLED=true  # 비로그인 접속 허용
-      - GF_AUTH_ANONYMOUS_ORG_ROLE=Admin # 들어오면 바로 관리자 권한
+      - GF_AUTH_ANONYMOUS_ENABLED=true
+      - GF_AUTH_ANONYMOUS_ORG_ROLE=Admin
+
+  # Redis (기존 유지 - 다른 용도로 쓸 수도 있으니)
   redis:
     image: redis:alpine
     container_name: message-broker
     ports:
       - "6379:6379"
+
+  # ============================================
+  # [NEW] Zookeeper - Kafka의 코디네이터
+  # ============================================
+  zookeeper:
+    image: confluentinc/cp-zookeeper:latest
+    container_name: zookeeper
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2181
+      ZOOKEEPER_TICK_TIME: 2000
+    ports:
+      - "2181:2181"
+    # 볼륨 마운트 (선택사항 - 데이터 영구 보존)
+    # volumes:
+    #   - zookeeper-data:/var/lib/zookeeper/data
+    #   - zookeeper-logs:/var/lib/zookeeper/log
+
+  # ============================================
+  # [NEW] Kafka - 메시지 브로커
+  # ============================================
+  kafka:
+    image: confluentinc/cp-kafka:latest
+    container_name: kafka
+    depends_on:
+      - zookeeper  # Zookeeper가 먼저 떠야 함
+    ports:
+      - "9092:9092"   # 외부(호스트)에서 접근
+      - "9093:9093"   # 내부(컨테이너)에서 접근
+    environment:
+      # Kafka 브로커 ID
+      KAFKA_BROKER_ID: 1
+
+      # Zookeeper 연결
+      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+
+      # ============================================
+      # [중요!] Listener 설정
+      # PLAINTEXT: 암호화 안 함 (로컬 테스트용)
+      # PLAINTEXT_HOST: 호스트(localhost)에서 접근
+      # ============================================
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9093,PLAINTEXT_HOST://localhost:9092
+      KAFKA_LISTENERS: PLAINTEXT://0.0.0.0:9093,PLAINTEXT_HOST://0.0.0.0:9092
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+
+      # Topic 자동 생성 설정
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+      KAFKA_DELETE_TOPIC_ENABLE: "true"
+
+      # 로그 및 복제 설정
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+
+      # 로그 보존 설정
+      KAFKA_LOG_RETENTION_HOURS: 168  # 7일
+      KAFKA_LOG_SEGMENT_BYTES: 1073741824  # 1GB
+
+    # 볼륨 마운트 (선택사항 - 데이터 영구 보존)
+    # volumes:
+    #   - kafka-data:/var/lib/kafka/data
+
+  # ============================================
+  # [선택사항] Kafka UI - 웹에서 Kafka 모니터링
+  # localhost:8080 접속하면 Kafka 상태 확인 가능
+  # ============================================
+  kafka-ui:
+    image: provectuslabs/kafka-ui:latest
+    container_name: kafka-ui
+    depends_on:
+      - kafka
+    ports:
+      - "8089:8080"  # 8080은 Gin이 쓰니까 8089로 변경
+    environment:
+      KAFKA_CLUSTERS_0_NAME: local
+      KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: kafka:9093
+      KAFKA_CLUSTERS_0_ZOOKEEPER: zookeeper:2181
+
+# 볼륨 정의 (데이터 영구 보존하려면 주석 해제)
+# volumes:
+#   zookeeper-data:
+#   zookeeper-logs:
+#   kafka-data:

@@ -4,15 +4,15 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"github.com/redis/go-redis/v9"
 	"log"
 	"log/slog"
 	"net/http"
 	"time"
 
 	"github.com/gofiber/fiber/v2"
+	"github.com/segmentio/kafka-go"
 
-	"go.opentelemetry.io/contrib/bridges/otelslog" // ★ 핵심: Log Bridge 추가
+	"go.opentelemetry.io/contrib/bridges/otelslog"
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/codes"
@@ -29,6 +29,12 @@ import (
 
 var tracer = otel.Tracer("dms-storage-worker")
 
+// ============================================
+// [NEW] Kafka Writer (Producer) 전역 변수
+// Redis Client 대신 Kafka Writer 사용
+// ============================================
+var kafkaWriter *kafka.Writer
+
 type TaskRequest struct {
 	DocTitle string `json:"doc_title"`
 	Action   string `json:"action"`
@@ -37,20 +43,36 @@ type TaskRequest struct {
 func main() {
 	ctx := context.Background()
 
-	rdb := redis.NewClient(&redis.Options{
-		Addr: "localhost:6379",
-	})
+	// ============================================
+	// [변경] Redis → Kafka Writer 초기화
+	// ============================================
+	kafkaWriter = &kafka.Writer{
+		Addr:     kafka.TCP("localhost:9092"), // Kafka 브로커 주소
+		Topic:    "task.complete",             // Topic 이름 (Redis의 채널과 동일한 개념)
+		Balancer: &kafka.LeastBytes{},         // 파티션 분배 전략: 가장 적게 쓴 파티션으로
 
-	// 1. Trace 초기화
+		// 성능 튜닝 옵션
+		BatchSize:    100,                   // 100개씩 모아서 한 번에 전송 (효율성 UP)
+		BatchTimeout: 10 * time.Millisecond, // 100개 안 모여도 10ms 지나면 전송
+		Compression:  kafka.Snappy,          // 압축 (네트워크 트래픽 감소)
+
+		// 전달 보장 레벨 설정
+		RequiredAcks: kafka.RequireOne, // 1개 브로커만 확인하면 OK (빠름)
+		// RequiredAcks: kafka.RequireAll,     // 모든 복제본 확인 (느리지만 안전)
+
+		// 에러 처리
+		MaxAttempts: 3, // 전송 실패 시 3번까지 재시도
+	}
+	defer kafkaWriter.Close() // 프로그램 종료 시 정리
+
+	// Trace 초기화
 	shutdownTracer := initTracer()
 	defer shutdownTracer(ctx)
 
-	// 2. [NEW] Log 초기화 (로그를 4317로 쏘는 설정)
+	// Log 초기화
 	shutdownLogger := initLogger()
 	defer shutdownLogger(ctx)
 
-	// 3. [NEW] slog를 OTel과 연결
-	// 이제부터 찍는 로그는 Loki로 날아갑니다.
 	logger := otelslog.NewLogger("dms-storage-worker-logger")
 	slog.SetDefault(logger)
 
@@ -59,14 +81,12 @@ func main() {
 	})
 
 	// ============================================
-	// 수동 미들웨어: Gin이 보낸 TraceID 받기
+	// 미들웨어: Gin이 보낸 TraceID 받기
 	// ============================================
 	app.Use(func(c *fiber.Ctx) error {
-		// 1. HTTP 헤더에서 Trace Context 추출
 		carrier := &FiberHeaderCarrier{c: c}
 		extractedCtx := otel.GetTextMapPropagator().Extract(context.Background(), carrier)
 
-		// 2. 새로운 Span 시작 (Gin의 TraceID를 이어받음)
 		spanCtx, span := tracer.Start(extractedCtx, c.Path(),
 			trace.WithAttributes(
 				attribute.String("http.method", c.Method()),
@@ -74,9 +94,7 @@ func main() {
 			),
 		)
 
-		// 3. Context를 Fiber에 저장 (중요: 이 spanCtx에 TraceID가 있음)
 		c.SetUserContext(spanCtx)
-
 		err := c.Next()
 
 		if err != nil {
@@ -92,30 +110,23 @@ func main() {
 	})
 
 	app.Post("/internal/process", func(c *fiber.Ctx) error {
-		// 미들웨어에서 넣어준 Context (Trace info 포함)
 		ctx := c.UserContext()
-
-		// TraceID 추출 (디버깅용 - 실제 전송은 Context가 알아서 함)
 		span := trace.SpanFromContext(ctx)
 		traceID := span.SpanContext().TraceID().String()
 
 		req := new(TaskRequest)
 
-		// [수정] 로그는 파싱 '후'에 찍어야 내용이 보입니다.
 		if err := c.BodyParser(req); err != nil {
 			span.RecordError(err)
 			span.SetStatus(codes.Error, "파싱 실패")
-			// 에러 로그도 Context와 함께 전송
 			slog.ErrorContext(ctx, "Body Parsing Failed", "error", err)
 			return c.Status(400).JSON(fiber.Map{"error": "파싱 실패"})
 		}
 
-		// [NEW] OTel Log 전송
-		// InfoContext를 쓰면 TraceID가 자동으로 붙어서 날아갑니다.
 		slog.InfoContext(ctx, "Fiber 작업 시작",
 			"action", req.Action,
 			"doc_title", req.DocTitle,
-			"manual_trace_id", traceID, // 확인용으로 명시적 추가도 가능
+			"manual_trace_id", traceID,
 		)
 
 		fmt.Printf("⚡ [Fiber] 작업 처리 중... TraceID: %s\n", traceID)
@@ -133,41 +144,10 @@ func main() {
 
 		fmt.Printf("✅ [Fiber] 완료!\n")
 
-		go func(traceID string) {
-			payload := map[string]string{
-				"trace_id": traceID,
-				"status":   "DONE",
-				"message":  "Redis로 알림 보냄",
-			}
-			jsonBody, _ := json.Marshal(payload)
-
-			// "task.complete" 채널에 발행(Publish)
-			err := rdb.Publish(context.Background(), "task.complete", jsonBody).Err()
-
-			if err != nil {
-				slog.Error("Redis 발행 실패", "error", err)
-			} else {
-				fmt.Printf("📢 [Worker] Redis 이벤트 발행 완료 (TraceID: %s)\n", traceID)
-			}
-		}(traceID)
-		//go func(targetURL, traceID string) {
-		//	payload := map[string]string{
-		//		"trace_id": traceID,
-		//		"status":   "DONE",
-		//		"message":  "PDF 아카이빙 성공",
-		//	}
-		//	jsonBody, _ := json.Marshal(payload)
-		//
-		//	// Gateway로 POST 요청 발사!
-		//	// (실제 운영에선 재시도(Retry) 로직이 필요하지만 지금은 심플하게)
-		//	resp, err := http.Post("http://localhost:8080/callbacks/task-complete", "application/json", bytes.NewBuffer(jsonBody))
-		//	if err != nil {
-		//		fmt.Printf("❌ 콜백 실패: %v\n", err)
-		//		return
-		//	}
-		//	defer resp.Body.Close()
-		//	fmt.Printf("📞 [Worker] Gateway로 콜백 완료\n")
-		//}("http://localhost:8080/callbacks/task-complete", traceID)
+		// ============================================
+		// [변경] Redis Publish → Kafka 메시지 발행
+		// ============================================
+		go publishToKafka(ctx, traceID)
 
 		return c.Status(http.StatusOK).JSON(fiber.Map{
 			"status": "PROCESSED",
@@ -178,7 +158,66 @@ func main() {
 	app.Listen(":8081")
 }
 
-// ... FiberHeaderCarrier 구조체 등은 그대로 유지 ...
+// ============================================
+// [NEW] Kafka로 메시지 발행하는 함수
+// 기존: rdb.Publish()
+// 변경: kafkaWriter.WriteMessages()
+// ============================================
+func publishToKafka(ctx context.Context, traceID string) {
+	// 메시지 구조체 생성 (Redis와 동일한 양식)
+	event := map[string]string{
+		"trace_id": traceID,
+		"status":   "DONE",
+		"message":  "Kafka로 알림 보냄",
+	}
+
+	jsonBody, err := json.Marshal(event)
+	if err != nil {
+		slog.Error("JSON 마샬링 실패", "error", err)
+		return
+	}
+
+	// Kafka 메시지 생성
+	msg := kafka.Message{
+		// Key: 같은 Key는 같은 파티션으로 가서 순서 보장됨
+		// traceID를 Key로 쓰면 같은 작업은 순서대로 처리됨
+		Key: []byte(traceID),
+
+		// Value: 실제 메시지 내용 (JSON)
+		Value: jsonBody,
+
+		// Time: 메시지 생성 시간 (Kafka가 자동 기록도 하지만 명시 가능)
+		Time: time.Now(),
+
+		// Headers: 추가 메타데이터 (선택사항)
+		// 예: OpenTelemetry TraceID를 헤더에도 넣을 수 있음
+		Headers: []kafka.Header{
+			{Key: "trace-id", Value: []byte(traceID)},
+		},
+	}
+
+	// Kafka로 메시지 전송
+	// WriteMessages는 동기 방식 (전송 완료까지 대기)
+	err = kafkaWriter.WriteMessages(ctx, msg)
+
+	if err != nil {
+		// 전송 실패 시 (네트워크 문제, Kafka 다운 등)
+		slog.ErrorContext(ctx, "Kafka 전송 실패",
+			"error", err,
+			"trace_id", traceID,
+		)
+		return
+	}
+
+	// 성공 로그
+	fmt.Printf("📤 [Kafka] 메시지 발행 완료 (TraceID: %s)\n", traceID)
+	slog.InfoContext(ctx, "Kafka 발행 성공",
+		"trace_id", traceID,
+		"topic", "task.complete",
+	)
+}
+
+// FiberHeaderCarrier 구조체 (변경 없음)
 type FiberHeaderCarrier struct {
 	c *fiber.Ctx
 }
@@ -193,9 +232,7 @@ func (f *FiberHeaderCarrier) Keys() []string {
 	return keys
 }
 
-// ============================================
-// Trace 초기화
-// ============================================
+// Tracer 초기화 (변경 없음)
 func initTracer() func(context.Context) error {
 	ctx := context.Background()
 	exporter, err := otlptracegrpc.New(ctx,
@@ -208,7 +245,7 @@ func initTracer() func(context.Context) error {
 
 	res, _ := resource.New(ctx,
 		resource.WithAttributes(
-			semconv.ServiceNameKey.String("dms-storage-worker"), // 서비스명 확인
+			semconv.ServiceNameKey.String("dms-storage-worker"),
 		),
 	)
 
@@ -217,14 +254,15 @@ func initTracer() func(context.Context) error {
 		sdktrace.WithResource(res),
 	)
 	otel.SetTracerProvider(tp)
-	otel.SetTextMapPropagator(propagation.NewCompositeTextMapPropagator(propagation.TraceContext{}, propagation.Baggage{}))
+	otel.SetTextMapPropagator(propagation.NewCompositeTextMapPropagator(
+		propagation.TraceContext{},
+		propagation.Baggage{},
+	))
 
 	return tp.Shutdown
 }
 
-// ============================================
-// [NEW] Log 초기화 (Fiber용)
-// ============================================
+// Logger 초기화 (변경 없음)
 func initLogger() func(context.Context) error {
 	ctx := context.Background()
 
@@ -236,7 +274,6 @@ func initLogger() func(context.Context) error {
 		log.Fatalf("Log Init Error: %v", err)
 	}
 
-	// [수정] 서비스 이름을 Worker로 명확히 지정
 	res, _ := resource.New(ctx,
 		resource.WithAttributes(
 			semconv.ServiceNameKey.String("dms-storage-worker"),
@@ -248,7 +285,6 @@ func initLogger() func(context.Context) error {
 		sdklog.WithResource(res),
 	)
 
-	// 전역 로거 프로바이더 등록
 	global.SetLoggerProvider(lp)
 
 	return lp.Shutdown

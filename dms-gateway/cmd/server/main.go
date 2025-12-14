@@ -5,37 +5,36 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"github.com/gin-gonic/gin"
-	"github.com/redis/go-redis/v9"
-	"go.opentelemetry.io/contrib/bridges/otelslog"
-	"go.opentelemetry.io/contrib/instrumentation/github.com/gin-gonic/gin/otelgin"
-	"go.opentelemetry.io/otel/codes"
-	"go.opentelemetry.io/otel/log/global"
-	"go.opentelemetry.io/otel/sdk/resource"
 	"log"
 	"log/slog"
 	"net/http"
 	"time"
 
+	"github.com/gin-gonic/gin"
+	"github.com/segmentio/kafka-go"
+
+	"go.opentelemetry.io/contrib/bridges/otelslog"
+	"go.opentelemetry.io/contrib/instrumentation/github.com/gin-gonic/gin/otelgin"
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/codes"
 	"go.opentelemetry.io/otel/exporters/otlp/otlplog/otlploggrpc"
 	"go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracegrpc"
+	"go.opentelemetry.io/otel/log/global"
 	"go.opentelemetry.io/otel/propagation"
+	sdklog "go.opentelemetry.io/otel/sdk/log"
+	"go.opentelemetry.io/otel/sdk/resource"
 	sdktrace "go.opentelemetry.io/otel/sdk/trace"
 	semconv "go.opentelemetry.io/otel/semconv/v1.4.0"
 	"go.opentelemetry.io/otel/trace"
-
-	sdklog "go.opentelemetry.io/otel/sdk/log"
 )
 
 const storageServiceURL = "http://localhost:8081/internal/process"
 
-// 전역 Tracer 생성 (이름은 프로젝트명)
 var tracer = otel.Tracer("dms-gateway")
 
 type Job struct {
-	Ctx    context.Context // Trace 정보가 여기 다 들어있음!
+	Ctx    context.Context
 	Title  string
 	Author string
 }
@@ -45,54 +44,109 @@ var jobQueue = make(chan Job, 100000)
 func main() {
 	ctx := context.Background()
 
-	rdb := redis.NewClient(&redis.Options{
-		Addr: "localhost:6379", // 도커 컴포즈 서비스명 쓰려면 "redis:6379"
+	// ============================================
+	// [변경] Redis Subscribe → Kafka Consumer
+	// ============================================
+	// Kafka Reader (Consumer) 초기화
+	kafkaReader := kafka.NewReader(kafka.ReaderConfig{
+		Brokers: []string{"localhost:9092"}, // Kafka 브로커 주소 (여러 개 가능)
+		Topic:   "task.complete",            // 구독할 Topic
+		GroupID: "gateway-service-group",    // Consumer Group ID (중요!)
+
+		// Consumer Group 설명:
+		// - 같은 GroupID를 가진 Consumer들은 파티션을 나눠서 처리
+		// - 예: 파티션 3개, Consumer 2개 → Consumer A(파티션 0,1), B(파티션 2)
+		// - 다른 GroupID는 독립적으로 모든 메시지 받음
+
+		// 읽기 설정
+		MinBytes: 1,                      // 최소 1바이트만 있어도 가져옴
+		MaxBytes: 10e6,                   // 한 번에 최대 10MB까지 읽기
+		MaxWait:  500 * time.Millisecond, // 메시지 없으면 500ms 대기
+
+		// 오프셋 커밋 설정 (중요!)
+		// 오프셋 = "어디까지 읽었는지" 기록
+		CommitInterval: time.Second, // 1초마다 자동으로 오프셋 커밋
+
+		// 시작 위치 설정
+		StartOffset: kafka.LastOffset, // 최신 메시지부터 읽기 (기본값)
+		// StartOffset: kafka.FirstOffset,    // 처음부터 읽기 (재처리할 때)
+
+		// 에러 처리
+		MaxAttempts: 3, // 읽기 실패 시 3번 재시도
 	})
+	defer kafkaReader.Close()
 
+	// ============================================
+	// [NEW] Kafka Consumer 고루틴
+	// 기존: Redis Subscribe goroutine
+	// 변경: Kafka ReadMessage loop
+	// ============================================
 	go func() {
-		// "task.complete" 라는 채널을 구독
-		pubsub := rdb.Subscribe(ctx, "task.complete")
-		defer pubsub.Close()
+		fmt.Println("🎧 [Gateway] Kafka Consumer 시작: task.complete 구독 중...")
 
-		// 채널 획득
-		ch := pubsub.Channel()
+		for {
+			// Kafka에서 메시지 읽기 (블로킹 방식)
+			// 메시지가 올 때까지 여기서 대기
+			msg, err := kafkaReader.ReadMessage(context.Background())
 
-		fmt.Println("🎧 [Gateway] Redis 구독 시작: task.complete 채널 대기 중...")
+			if err != nil {
+				// 읽기 실패 (네트워크 문제, Kafka 다운 등)
+				slog.Error("Kafka 읽기 실패", "error", err)
+				time.Sleep(time.Second) // 1초 대기 후 재시도
+				continue
+			}
 
-		// 메시지가 올 때까지 여기서 대기 (무한 루프)
-		for msg := range ch {
+			// ============================================
+			// 메시지 처리 (Redis와 동일한 구조)
+			// ============================================
 			var result struct {
 				TraceID string `json:"trace_id"`
 				Status  string `json:"status"`
 				Message string `json:"message"`
 			}
-			json.Unmarshal([]byte(msg.Payload), &result)
+
+			// JSON 파싱
+			if err := json.Unmarshal(msg.Value, &result); err != nil {
+				slog.Error("JSON 파싱 실패",
+					"error", err,
+					"raw_message", string(msg.Value),
+				)
+				continue
+			}
 
 			// 로그 찍기 (Loki로 전송)
-			slog.InfoContext(ctx, "📢 [Redis] 작업 완료 수신!",
+			slog.Info("📥 [Kafka] 작업 완료 수신!",
 				"original_trace_id", result.TraceID,
 				"status", result.Status,
-				"msg_source", "redis-pubsub",
+				"msg_source", "kafka",
+				"partition", msg.Partition, // 어느 파티션에서 왔는지
+				"offset", msg.Offset, // 오프셋 (순서 번호)
+				"key", string(msg.Key), // Key 값
 			)
+
+			// ============================================
+			// [참고] Kafka는 자동 커밋됨 (CommitInterval 설정에 따라)
+			// Redis는 Subscribe만 하면 끝이지만
+			// Kafka는 "어디까지 읽었는지" 기록해야 재시작 시 이어서 처리 가능
+			// ============================================
+
+			// 여기서 DB 업데이트, 웹소켓 알림 등 비즈니스 로직 처리
+			// ...
 		}
 	}()
 
-	// 1. Trace 초기화
+	// Trace 초기화
 	shutdown := initTracer()
 	defer shutdown(context.Background())
 
-	// 2. Log 초기화 (OTLP 연결 설정)
+	// Log 초기화
 	shutdownLogger := initLogger()
 	defer shutdownLogger(ctx)
 
-	// =================================================================
-	// [수정된 부분] 로거 설정
-	// 기존: os.Stdout (화면 출력) -> Loki로 안 감 ❌
-	// 변경: otelslog (OTel 전송) -> Loki로 날아감 ✅
-	// =================================================================
 	logger := otelslog.NewLogger("dms-gateway-logger")
 	slog.SetDefault(logger)
 
+	// Worker Pool 시작 (변경 없음)
 	for i := 0; i < 50; i++ {
 		go worker(i)
 	}
@@ -117,14 +171,9 @@ func main() {
 		traceID := span.SpanContext().TraceID().String()
 		fmt.Printf("[Gin] 매니저: 요청 접수 (TraceID: %s)\n", traceID)
 
-		// =================================================================
-		// [수정된 부분] 로그 찍기
-		// Info -> InfoContext 로 변경해야 ctx 안에 있는 TraceID가 자동으로 같이 전송됩니다.
-		// =================================================================
 		slog.InfoContext(ctx, "요청 접수 완료",
 			"doc_title", req.Title,
 			"author", req.Author,
-			// "trace_id"는 InfoContext가 자동으로 넣어주므로 굳이 수동으로 안 넣어도 됨
 		)
 
 		job := Job{
@@ -145,6 +194,10 @@ func main() {
 		}
 	})
 
+	// ============================================
+	// [참고] HTTP 콜백 엔드포인트는 그대로 유지 가능
+	// Kafka + HTTP 콜백 둘 다 사용해도 됨
+	// ============================================
 	r.POST("/callbacks/task-complete", func(c *gin.Context) {
 		var result struct {
 			TraceID string `json:"trace_id"`
@@ -155,8 +208,6 @@ func main() {
 			return
 		}
 
-		// 로그 찍기 (여기서 DB 업데이트나 클라이언트에게 웹소켓 알림을 보냄)
-		// context를 새로 만들지 않고, 들어온 요청의 context를 사용해 로그를 남김
 		slog.InfoContext(c.Request.Context(), "📨 [Gateway] Worker로부터 완료 보고 수신!",
 			"original_trace_id", result.TraceID,
 			"status", result.Status,
@@ -169,6 +220,7 @@ func main() {
 	r.Run(":8080")
 }
 
+// Worker 함수 (변경 없음)
 func worker(id int) {
 	client := &http.Client{Timeout: 10 * time.Second}
 
@@ -194,33 +246,23 @@ func worker(id int) {
 		if err != nil {
 			span.RecordError(err)
 			span.SetStatus(codes.Error, "HTTP call failed")
-
-			// [추가] 에러 로그도 Loki로 보내기
 			slog.ErrorContext(childCtx, "Worker HTTP 요청 실패", "worker_id", id, "error", err)
-
 			span.End()
 			continue
 		}
 		resp.Body.Close()
 
 		fmt.Printf("[일꾼 %d] 처리 완료\n", id)
-
-		// [추가] 완료 로그도 Loki로 보내기
 		slog.InfoContext(childCtx, "Worker 처리 완료", "worker_id", id)
 
 		span.End()
 	}
 }
 
-// ==========================================================
-// 아래는 그냥 복사해서 쓰세요 (초기화 보일러플레이트 코드)
-// ==========================================================
-
+// Tracer 초기화 (변경 없음)
 func initTracer() func(context.Context) error {
 	ctx := context.Background()
 
-	// 1. OTLP Exporter 설정 (Docker로 띄운 OTel Collector 주소)
-	// insecure 옵션은 로컬 테스트용입니다.
 	exporter, err := otlptracegrpc.New(ctx,
 		otlptracegrpc.WithInsecure(),
 		otlptracegrpc.WithEndpoint("localhost:4317"),
@@ -229,7 +271,6 @@ func initTracer() func(context.Context) error {
 		log.Fatalf("OTLP Exporter 생성 실패: %v", err)
 	}
 
-	// 2. Resource 설정 (서비스 이름 등)
 	res, err := resource.New(ctx,
 		resource.WithAttributes(
 			semconv.ServiceNameKey.String("dms-gateway-service"),
@@ -239,17 +280,12 @@ func initTracer() func(context.Context) error {
 		log.Fatalf("Resource 생성 실패: %v", err)
 	}
 
-	// 3. Tracer Provider 설정
 	tp := sdktrace.NewTracerProvider(
 		sdktrace.WithBatcher(exporter),
 		sdktrace.WithResource(res),
 	)
 
-	// 전역 Provider로 등록
 	otel.SetTracerProvider(tp)
-
-	// 4. Propagator 설정 (서버 간 헤더 전파 방식)
-	// W3C Trace Context 표준을 사용합니다.
 	otel.SetTextMapPropagator(propagation.NewCompositeTextMapPropagator(
 		propagation.TraceContext{},
 		propagation.Baggage{},
@@ -258,10 +294,10 @@ func initTracer() func(context.Context) error {
 	return tp.Shutdown
 }
 
+// Logger 초기화 (변경 없음)
 func initLogger() func(context.Context) error {
 	ctx := context.Background()
 
-	// 1. Log Exporter 생성 (Trace랑 똑같이 4317로 쏩니다)
 	exporter, err := otlploggrpc.New(ctx,
 		otlploggrpc.WithInsecure(),
 		otlploggrpc.WithEndpoint("localhost:4317"),
@@ -270,20 +306,17 @@ func initLogger() func(context.Context) error {
 		log.Fatalf("Log Exporter 에러: %v", err)
 	}
 
-	// 2. Resource 정의 (서비스 이름 - 이게 Loki의 service 라벨이 됩니다)
 	res, _ := resource.New(ctx,
 		resource.WithAttributes(
 			semconv.ServiceNameKey.String("dms-gateway"),
 		),
 	)
 
-	// 3. Logger Provider 생성
 	lp := sdklog.NewLoggerProvider(
 		sdklog.WithProcessor(sdklog.NewBatchProcessor(exporter)),
 		sdklog.WithResource(res),
 	)
 
-	// 4. 전역 설정 등록
 	global.SetLoggerProvider(lp)
 
 	return lp.Shutdown
