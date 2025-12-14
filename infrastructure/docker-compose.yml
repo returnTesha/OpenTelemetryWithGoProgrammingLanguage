@@ -1,18 +1,17 @@
-version: "3"
+version: "3.8"
+
 services:
-  # LGTM - Prometheus + Jaeger + Loki + Grafana 통합
   lgtm:
     image: grafana/otel-lgtm:latest
     container_name: lgtm
     ports:
-      - "3000:3000"   # Grafana UI
-      - "4317:4317"   # OTLP gRPC
-      - "4318:4318"   # OTLP HTTP
+      - "3000:3000"
+      - "4317:4317"
+      - "4318:4318"
     environment:
       - GF_AUTH_ANONYMOUS_ENABLED=true
       - GF_AUTH_ANONYMOUS_ORG_ROLE=Admin
 
-  # Redis (기존 유지 - 다른 용도로 쓸 수도 있으니)
   redis:
     image: redis:alpine
     container_name: message-broker
@@ -20,84 +19,97 @@ services:
       - "6379:6379"
 
   # ============================================
-  # [NEW] Zookeeper - Kafka의 코디네이터
-  # ============================================
-  zookeeper:
-    image: confluentinc/cp-zookeeper:latest
-    container_name: zookeeper
-    environment:
-      ZOOKEEPER_CLIENT_PORT: 2181
-      ZOOKEEPER_TICK_TIME: 2000
-    ports:
-      - "2181:2181"
-    # 볼륨 마운트 (선택사항 - 데이터 영구 보존)
-    # volumes:
-    #   - zookeeper-data:/var/lib/zookeeper/data
-    #   - zookeeper-logs:/var/lib/zookeeper/log
-
-  # ============================================
-  # [NEW] Kafka - 메시지 브로커
+  # [NEW] Kafka with KRaft (Zookeeper 없음!)
   # ============================================
   kafka:
     image: confluentinc/cp-kafka:latest
     container_name: kafka
-    depends_on:
-      - zookeeper  # Zookeeper가 먼저 떠야 함
     ports:
-      - "9092:9092"   # 외부(호스트)에서 접근
-      - "9093:9093"   # 내부(컨테이너)에서 접근
+      - "9092:9092"
+      - "9093:9093"
     environment:
-      # Kafka 브로커 ID
-      KAFKA_BROKER_ID: 1
-
-      # Zookeeper 연결
-      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
-
       # ============================================
-      # [중요!] Listener 설정
-      # PLAINTEXT: 암호화 안 함 (로컬 테스트용)
-      # PLAINTEXT_HOST: 호스트(localhost)에서 접근
+      # KRaft 모드 설정 (핵심!)
       # ============================================
-      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
-      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9093,PLAINTEXT_HOST://localhost:9092
-      KAFKA_LISTENERS: PLAINTEXT://0.0.0.0:9093,PLAINTEXT_HOST://0.0.0.0:9092
-      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
-
-      # Topic 자동 생성 설정
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: 'broker,controller'  # 브로커 + 컨트롤러 역할 동시 수행
+      KAFKA_CONTROLLER_QUORUM_VOTERS: '1@kafka:9094'  # 컨트롤러 투표자 목록
+      KAFKA_CONTROLLER_LISTENER_NAMES: 'CONTROLLER'
+      
+      # ============================================
+      # Listener 설정
+      # ============================================
+      KAFKA_LISTENERS: 'PLAINTEXT://0.0.0.0:9093,PLAINTEXT_HOST://0.0.0.0:9092,CONTROLLER://0.0.0.0:9094'
+      KAFKA_ADVERTISED_LISTENERS: 'PLAINTEXT://kafka:9093,PLAINTEXT_HOST://localhost:9092'
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: 'PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT,CONTROLLER:PLAINTEXT'
+      KAFKA_INTER_BROKER_LISTENER_NAME: 'PLAINTEXT'
+      
+      # ============================================
+      # 로그 디렉토리 (KRaft는 별도 디렉토리 필요)
+      # ============================================
+      KAFKA_LOG_DIRS: '/tmp/kraft-combined-logs'
+      
+      # ============================================
+      # Cluster ID (KRaft 필수!)
+      # 아래 명령어로 생성: kafka-storage random-uuid
+      # 또는 아무 UUID나 사용 가능
+      # ============================================
+      CLUSTER_ID: 'MkU3OEVBNTcwNTJENDM2Qk'  # 예시 UUID
+      
+      # ============================================
+      # Topic 설정
+      # ============================================
       KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
       KAFKA_DELETE_TOPIC_ENABLE: "true"
-
-      # 로그 및 복제 설정
+      
+      # ============================================
+      # 복제 설정 (단일 노드이므로 1)
+      # ============================================
       KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
       KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
       KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
-
+      
       # 로그 보존 설정
-      KAFKA_LOG_RETENTION_HOURS: 168  # 7일
-      KAFKA_LOG_SEGMENT_BYTES: 1073741824  # 1GB
-
-    # 볼륨 마운트 (선택사항 - 데이터 영구 보존)
+      KAFKA_LOG_RETENTION_HOURS: 168
+      KAFKA_LOG_SEGMENT_BYTES: 1073741824
+    
+    # ============================================
+    # Healthcheck
+    # ============================================
+    healthcheck:
+      test: ["CMD-SHELL", "kafka-broker-api-versions --bootstrap-server localhost:9092 || exit 1"]
+      interval: 10s
+      timeout: 10s
+      retries: 5
+      start_period: 40s
+    
+    # ============================================
+    # [선택사항] 볼륨 마운트
+    # ============================================
     # volumes:
-    #   - kafka-data:/var/lib/kafka/data
+    #   - kafka-data:/tmp/kraft-combined-logs
 
   # ============================================
-  # [선택사항] Kafka UI - 웹에서 Kafka 모니터링
-  # localhost:8080 접속하면 Kafka 상태 확인 가능
+  # Kafka UI
   # ============================================
   kafka-ui:
     image: provectuslabs/kafka-ui:latest
     container_name: kafka-ui
     depends_on:
-      - kafka
+      kafka:
+        condition: service_healthy
     ports:
-      - "8089:8080"  # 8080은 Gin이 쓰니까 8089로 변경
+      - "8089:8080"
     environment:
       KAFKA_CLUSTERS_0_NAME: local
       KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: kafka:9093
-      KAFKA_CLUSTERS_0_ZOOKEEPER: zookeeper:2181
+      # ============================================
+      # [변경] Zookeeper 설정 제거!
+      # KAFKA_CLUSTERS_0_ZOOKEEPER: zookeeper:2181  # ← 삭제
+      # ============================================
+      DYNAMIC_CONFIG_ENABLED: "true"
+    restart: unless-stopped
 
-# 볼륨 정의 (데이터 영구 보존하려면 주석 해제)
+# 볼륨 정의 (선택사항)
 # volumes:
-#   zookeeper-data:
-#   zookeeper-logs:
 #   kafka-data:
