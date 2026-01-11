@@ -1,4 +1,4 @@
-##[작업 요약: 중앙 집중형 에러 관측 시스템(Observability System) 구축]
+## [작업 요약: 중앙 집중형 에러 관측 시스템(Observability System) 구축]
 
 **1. Application 단계 (Spring Boot)**
 
